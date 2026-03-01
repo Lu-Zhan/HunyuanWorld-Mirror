@@ -53,6 +53,12 @@ logger:
   - _target_: lightning.pytorch.loggers.csv_logs.CSVLogger
     save_dir: "${paths.log_dir}"
     name: "csv"
+  # Optional: SwanLab logger (uncomment to enable)
+  # - _target_: swanlab.integration.lightning.SwanLabLogger
+  #   project: "hunyuan-world-mirror"
+  #   experiment_name: "${task_name}"
+  #   description: null
+  #   logdir: "${paths.log_dir}/swanlab"
 
 callbacks:
   - _target_: training.utils.callbacks.StepBasedProgressBar

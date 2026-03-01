@@ -26,6 +26,71 @@ Color = Union[
 
 VIZ_INTERVAL = 250
 
+
+def _log_image(loggers, tag: str, image_chw: np.ndarray, step: int):
+    """将图像记录到所有兼容的 logger（支持 TensorBoard 和 SwanLab）。
+
+    Args:
+        loggers: 单个 logger 或 logger 列表
+        tag: 指标名称
+        image_chw: shape [C, H, W] 的 uint8 numpy 数组
+        step: 全局步数
+    """
+    if loggers is None:
+        return
+    for lg in (loggers if isinstance(loggers, list) else [loggers]):
+        if lg is None:
+            continue
+        try:
+            if isinstance(lg, TensorBoardLogger):
+                lg.experiment.add_image(tag, image_chw, step)
+                continue
+        except Exception:
+            pass
+        try:
+            from swanlab.integration.lightning import SwanLabLogger
+            import swanlab
+            if isinstance(lg, SwanLabLogger):
+                image_hwc = image_chw.transpose(1, 2, 0)
+                lg.experiment.log({tag: swanlab.Image(image_hwc)}, step=step)
+                continue
+        except Exception:
+            pass
+
+
+def _log_video(loggers, tag: str, video_tchw: np.ndarray, step: int, fps: int = 30):
+    """将视频记录到所有兼容的 logger（支持 TensorBoard 和 SwanLab）。
+
+    Args:
+        loggers: 单个 logger 或 logger 列表
+        tag: 指标名称
+        video_tchw: shape [T, C, H, W] 的 uint8 numpy 数组
+        step: 全局步数
+        fps: 帧率
+    """
+    if loggers is None:
+        return
+    for lg in (loggers if isinstance(loggers, list) else [loggers]):
+        if lg is None:
+            continue
+        try:
+            if isinstance(lg, TensorBoardLogger):
+                lg.experiment.add_video(tag, video_tchw[None], global_step=step, fps=fps)
+                continue
+        except Exception:
+            pass
+        try:
+            from swanlab.integration.lightning import SwanLabLogger
+            import swanlab
+            if isinstance(lg, SwanLabLogger):
+                # SwanLab 期望 (T, H, W, C) 格式
+                video_thwc = video_tchw.transpose(0, 2, 3, 1)
+                lg.experiment.log({tag: swanlab.Video(video_thwc, fps=fps)}, step=step)
+                continue
+        except Exception:
+            pass
+
+
 def to_uint8_img(tensor: torch.Tensor) -> np.ndarray:
     return (tensor.detach().cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
 
@@ -112,7 +177,7 @@ def process_depths_for_vis(
 def log_training_input_and_output_images(
     preds: Dict[str, torch.Tensor],
     inputs: Dict[str, torch.Tensor],
-    logger: TensorBoardLogger,
+    logger,
     global_step: int,
     save_path: str = None,
 ):
@@ -192,14 +257,9 @@ def log_training_input_and_output_images(
         ]
         grid_np = add_text_labels_to_grid(grid_np, labels, row_height=h)
 
-        # Log to TensorBoard
+        # Log to loggers
         if logger is not None:
-            try:
-                logger.experiment.add_image(
-                    "train/input_and_output", grid_np.transpose(2, 0, 1), global_step
-                )
-            except:
-                pass
+            _log_image(logger, "train/input_and_output", grid_np.transpose(2, 0, 1), global_step)
 
         # Save to disk
         if save_path is not None:
@@ -217,7 +277,7 @@ def save_novel_view_render(
     gs_renderer: GaussianSplatRenderer,
     preds: Dict[str, Dict[str, torch.Tensor]],
     views: Dict[str, torch.Tensor],
-    logger: TensorBoardLogger,
+    logger,
     global_step: int,
     save_separately: bool = False,
     save_mask: bool = False,
@@ -248,14 +308,7 @@ def save_novel_view_render(
         return new_img
 
     def log_save_image(dataset_name, image):
-        try:
-            logger.experiment.add_image(
-                f"val_nvs_{cond_name}_{dataset_name}/image",
-                image,
-                global_step=global_step,
-            )
-        except:
-            pass
+        _log_image(logger, f"val_nvs_{cond_name}_{dataset_name}/image", image, global_step)
 
     def save_individual_images(
         gt_img, pred_img, mask_img, dir_path, base_fname, save_mask=False
@@ -323,7 +376,7 @@ def render_video_interpolation_multiview(
     gs_renderer: GaussianSplatRenderer,
     preds: Dict[str, Dict[str, torch.Tensor]],
     views: Dict[str, torch.Tensor],
-    logger: TensorBoardLogger,
+    logger,
     global_step: int,
     t: int = 20,
     loop_reverse: bool = True,
@@ -466,15 +519,7 @@ def render_video_interpolation_multiview(
         ),
         logger=None,
     )
-    try:
-        logger.experiment.add_video(
-            f"val_nvs_nocond_{views['dataset'][0]}/video",
-            video[None],
-            global_step=global_step,
-            fps=30,
-        )
-    except:
-        pass
+    _log_video(logger, f"val_nvs_nocond_{views['dataset'][0]}/video", video, global_step, fps=30)
 
 
 def apply_color_map(

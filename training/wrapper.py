@@ -29,6 +29,7 @@ from training.utils.eval.camera_pose_eval import (
     calculate_auc,
 )
 from training.utils.eval.normal_eval import get_normal_error, get_normal_metrics
+from training.utils.eval.albedo_eval import get_albedo_metrics
 from training.utils.eval.nvs_eval import RenderingMetrics
 from training.utils.eval.depthmap_eval import get_depth_metrics, EVAL_DEPTH_METADATA
 from training.utils.viz import save_novel_view_render, log_training_input_and_output_images
@@ -75,6 +76,9 @@ class WorldMirrorWrapper(LightningModule):
             lambda: defaultdict(lambda: defaultdict(dict))
         )
         self.normal_results = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(dict))
+        )
+        self.albedo_results = defaultdict(
             lambda: defaultdict(lambda: defaultdict(dict))
         )
         self.nvs_results = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
@@ -363,7 +367,7 @@ class WorldMirrorWrapper(LightningModule):
         
         # log training inputs and outputs
         if self.trainer.is_global_zero:
-            log_training_input_and_output_images(preds, batched_inputs, self.logger, self.global_step, save_path=self.vis_log_dir,)
+            log_training_input_and_output_images(preds, batched_inputs, self.loggers, self.global_step, save_path=self.vis_log_dir,)
         return loss
 
     def on_train_epoch_end(self):
@@ -436,6 +440,9 @@ class WorldMirrorWrapper(LightningModule):
         ]:
             self.eval_normal(preds_all, batched_inputs)
 
+        if "albedo" in self.eval_modalities and "albedo" in batched_inputs:
+            self.eval_albedo(preds_all, batched_inputs)
+
         if "nvs" in self.eval_modalities and dataset in [
             "re10k_nvs_test",
             "dl3dv_nvs_test",
@@ -447,7 +454,7 @@ class WorldMirrorWrapper(LightningModule):
                     self.model.gs_renderer,
                     preds_all,
                     batched_inputs,
-                    self.logger,
+                    self.loggers,
                     self.global_step,
                     save_path=self.vis_log_dir,
                 )
@@ -602,6 +609,29 @@ class WorldMirrorWrapper(LightningModule):
                 "a5": metrics["a5"],
             }
 
+    def eval_albedo(self, preds_all, batched_inputs):
+        for cond_name, preds in preds_all.items():
+            scene_name = "/".join(batched_inputs["label"][0].split(".")[:-1])
+
+            gt_albedo = batched_inputs["albedo"][0]       # [S, H, W, 3]
+            valid_mask = batched_inputs["valid_mask"][0]  # [S, 1, H, W]
+            # Convert mask to (S, H, W) boolean for pixel-level indexing
+            valid_mask_np = valid_mask[:, 0].detach().cpu().numpy().astype(bool)
+
+            pred_albedo = preds["albedo"][0]              # [S, H, W, 3]
+            dataset = batched_inputs["dataset"][0]
+
+            pred_np = pred_albedo.detach().cpu().numpy()
+            gt_np   = gt_albedo.detach().cpu().numpy()
+
+            metrics = get_albedo_metrics(pred_np, gt_np, valid_mask_np)
+
+            self.albedo_results[cond_name][dataset][scene_name] = {
+                "mae":  metrics["mae"],
+                "rmse": metrics["rmse"],
+                "psnr": metrics["psnr"],
+            }
+
     def eval_nvs(self, preds_all, batched_inputs):
         self.render_metrics.lpips_fn.to(self.device)
         assert "is_target" in batched_inputs
@@ -670,6 +700,7 @@ class WorldMirrorWrapper(LightningModule):
         self.merge_log_pointmap_results()
         self.merge_log_camera_pose_results()
         self.merge_log_normal_results()
+        self.merge_log_albedo_results()
         self.merge_log_nvs_results()
         self.merge_log_depthmap_results()
 
@@ -808,6 +839,41 @@ class WorldMirrorWrapper(LightningModule):
         # Clear all dataset metrics after logging
         self.normal_results.clear()
         self.normal_results = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(dict))
+        )
+
+    def merge_log_albedo_results(self):
+        # merge results from all GPUs to the main process
+        if torch.distributed.is_initialized():
+            plain_dict_results = convert_defaultdict_to_dict(self.albedo_results)
+            all_gpu_results = [None] * torch.distributed.get_world_size()
+            all_gather_object(all_gpu_results, plain_dict_results)
+
+            if self.trainer.is_global_zero:
+                merged_results = {}
+                for gpu_results in all_gpu_results:
+                    deep_merge_dict(merged_results, gpu_results)
+                self.albedo_results = merged_results
+
+        # only log the results on the main process
+        if not torch.distributed.is_initialized() or self.trainer.is_global_zero:
+            for name, datasets in self.albedo_results.items():
+                for dataset, scenes in datasets.items():
+                    metrics_lists = {"mae": [], "rmse": [], "psnr": []}
+
+                    for scene_name, metrics in scenes.items():
+                        for metric_name in metrics_lists.keys():
+                            metrics_lists[metric_name].append(metrics[metric_name])
+
+                    for metric_name, values in metrics_lists.items():
+                        mean_value = np.mean(values)
+                        self.log(
+                            f"val_albedo_{name}_{dataset}/{metric_name}", mean_value
+                        )
+
+        # Clear all dataset metrics after logging
+        self.albedo_results.clear()
+        self.albedo_results = defaultdict(
             lambda: defaultdict(lambda: defaultdict(dict))
         )
 
